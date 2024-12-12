@@ -1,4 +1,6 @@
 import MetaTrader5 as mt5
+import threading
+import time
 from settings import (
     account_size,
     target_gain_percent,
@@ -114,7 +116,7 @@ def place_market_order(symbol, action, lot_size, tp_distance, sl_distance, magic
         print(f"Failed to place {action} order: {result.retcode}")
         return None
 
-    print(f"{action} order placed successfully: {result}")
+    #print(f"{action} order placed successfully: {result}")
     return result
 
 
@@ -146,16 +148,27 @@ def adjust_volume(symbol, volume):
     return adjusted_volume
 
 
-def place_stop_orders(symbol, action, lot_sizes, tp_price, stop_levels, magic_number):
+def place_stop_orders(symbol, action, lot_sizes, tp_price, stop_levels, be_levels, magic_number):
     """
-    Place stop orders with validated stop levels, adjusting volume to the nearest valid step.
-    """
-    # Validate stop levels
-    valid_stop_levels = validate_stop_levels(symbol, stop_levels)
+    Place stop orders with SL based on BE levels.
 
-    for level, lot_size in zip(valid_stop_levels, lot_sizes):
-        # Adjust the lot size
-        adjusted_lot_size = adjust_volume(symbol, lot_size)
+    :param symbol: Trading symbol (e.g., "XAUUSD").
+    :param action: "BUY" or "SELL".
+    :param lot_sizes: List of lot sizes for stop orders.
+    :param tp_price: Take Profit price for the orders.
+    :param stop_levels: Validated stop levels.
+    :param be_levels: Break-even levels for SL calculation.
+    :param magic_number: Magic number to identify the orders.
+    """
+    tick = mt5.symbol_info_tick(symbol)
+    if not tick:
+        raise RuntimeError(f"Failed to retrieve tick data for {symbol}.")
+    point = mt5.symbol_info(symbol).point
+    current_price = tick.ask if action == "BUY" else tick.bid
+
+    for level, lot_size, be_level in zip(stop_levels, lot_sizes, be_levels):
+        # Determine SL price based on BE level
+        sl_price = (current_price - (be_level * point)) if action == "BUY" else (current_price + (be_level * point))
 
         # Determine order type
         order_type = mt5.ORDER_TYPE_BUY_STOP if action == "BUY" else mt5.ORDER_TYPE_SELL_STOP
@@ -164,11 +177,11 @@ def place_stop_orders(symbol, action, lot_sizes, tp_price, stop_levels, magic_nu
         request = {
             "action": mt5.TRADE_ACTION_PENDING,
             "symbol": symbol,
-            "volume": adjusted_lot_size,
+            "volume": round(lot_size, 2),
             "type": order_type,
             "price": level,
             "tp": tp_price,
-            "sl": 0.0,  # No SL for stop orders
+            "sl": sl_price,
             "deviation": 10,
             "magic": magic_number,
             "comment": f"{action} STOP order via script",
@@ -176,13 +189,13 @@ def place_stop_orders(symbol, action, lot_sizes, tp_price, stop_levels, magic_nu
             "type_filling": mt5.ORDER_FILLING_IOC,
         }
 
-        # Log the request
-        print("Attempting to place STOP order:")
-        print(f"  Lot Size: {adjusted_lot_size}")
-        print(f"  SL: {request['sl']}")
-        print(f"  TP: {request['tp']}")
-        print(f"  Comment: {request['comment']}")
-        print(f"  Request Data: {request}")
+        #print("\nAttempting to place STOP order:")
+        #print(f"  Action: {action}")
+        #print(f"  Lot Size: {lot_size}")
+        #print(f"  SL: {sl_price}")
+        #print(f"  TP: {tp_price}")
+        #print(f"  Comment: {request['comment']}")
+        #print(f"  Request Data: {request}")
 
         # Send the request
         result = mt5.order_send(request)
@@ -272,7 +285,6 @@ def print_order_contributions_with_be(contributions, lot_sizes, be_levels, total
 
         print(f"  Order {i}: ${contribution:.2f} (Lot Size: {lot_size:.2f}) {be_level_text} {sl_level_text}")
     print(f"  Total {direction} Contribution: ${total_contribution:.2f}")
-
 
 
 def calculate_stepped_lot_sizes(initial_lot_size, total_goal, tp_distance, pip_value, num_orders):
@@ -432,6 +444,77 @@ def calculate_sl_levels(current_price, stop_levels, symbol_info):
     return sl_levels
 
 
+def cancel_stop_orders(pending_orders, magic_number):
+    """
+    Cancel all STOP orders with a specific magic number.
+
+    :param pending_orders: List of pending orders.
+    :param magic_number: Magic number to identify STOP orders to cancel.
+    """
+    for order in pending_orders:
+        if order.magic == magic_number:
+            print(f"Canceling STOP order at price {order.price} with magic number {magic_number}...")
+
+            # Prepare cancel request
+            request = {
+                "action": mt5.TRADE_ACTION_REMOVE,
+                "order": order.ticket,
+                "magic": magic_number,
+                "symbol": order.symbol,
+                "comment": "Cancel STOP order via script",
+            }
+
+            result = mt5.order_send(request)
+            if result.retcode != mt5.TRADE_RETCODE_DONE:
+                print(f"Failed to cancel STOP order {order.ticket}: {result.retcode}")
+            else:
+                print(f"Successfully canceled STOP order {order.ticket}")
+
+
+def start_order_monitoring(symbol, magic_number_buy, magic_number_sell, check_interval=1):
+    """
+    Start a threaded monitoring process for stop-out events.
+
+    :param symbol: Trading symbol (e.g., "XAUUSD").
+    :param magic_number_buy: Magic number for BUY orders.
+    :param magic_number_sell: Magic number for SELL orders.
+    :param check_interval: Time interval (in seconds) to check orders.
+    """
+
+    def monitor_orders():
+        print("Monitoring orders for stop-out events (threaded)...")
+        while True:
+            # Fetch all open positions and pending orders
+            positions = mt5.positions_get(symbol=symbol)
+            pending_orders = mt5.orders_get(symbol=symbol)
+
+            if positions is None or pending_orders is None:
+                print("Failed to fetch positions or pending orders.")
+                break
+
+            # Group positions by magic number
+            active_magic_numbers = {pos.magic for pos in positions}
+
+            # Check for missing market orders
+            if magic_number_buy not in active_magic_numbers:
+                print(
+                    f"Market BUY order with magic number {magic_number_buy} is no longer active. Canceling related STOP orders...")
+                cancel_stop_orders(pending_orders, magic_number_buy)
+
+            if magic_number_sell not in active_magic_numbers:
+                print(
+                    f"Market SELL order with magic number {magic_number_sell} is no longer active. Canceling related STOP orders...")
+                cancel_stop_orders(pending_orders, magic_number_sell)
+
+            # Wait before next check
+            time.sleep(check_interval)
+
+    # Start monitoring in a separate thread
+    monitoring_thread = threading.Thread(target=monitor_orders, daemon=True)
+    monitoring_thread.start()
+    print("Order monitoring started in a background thread.")
+
+
 def main():
     # Ensure MetaTrader 5 is initialized
     if not mt5.initialize():
@@ -572,11 +655,10 @@ def main():
             place_market_order(symbol, "BUY", lot_sizes[0], number_of_pips, initial_stop_level, 1001)
             place_market_order(symbol, "SELL", lot_sizes[0], number_of_pips, initial_stop_level, 1002)
 
-            print(f"Validated BUY Stop Levels: {stop_levels_buy}")
-            print(f"Validated SELL Stop Levels: {stop_levels_sell}")
+            place_stop_orders(symbol, "BUY", lot_sizes[1:], buy_tp_price, stop_levels_buy, be_levels, 1001)
+            place_stop_orders(symbol, "SELL", lot_sizes[1:], sell_tp_price, stop_levels_sell, be_levels, 1002)
 
-            place_stop_orders(symbol, "BUY", lot_sizes[1:], buy_tp_price, stop_levels_buy, 1001)
-            place_stop_orders(symbol, "SELL", lot_sizes[1:], sell_tp_price, stop_levels_sell, 1002)
+            start_order_monitoring(symbol, magic_number_buy=1001, magic_number_sell=1002)
 
             print("All orders have been placed successfully.")
         else:
