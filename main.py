@@ -118,26 +118,53 @@ def place_market_order(symbol, action, lot_size, tp_distance, sl_distance, magic
     return result
 
 
-def place_stop_orders(symbol, action, lot_sizes, tp_price, stop_levels, magic_number):
+def adjust_volume(symbol, volume):
     """
-    Places additional stop orders (BUY STOP / SELL STOP) with shared TP.
+    Adjust the lot size (volume) to the nearest valid step for the given symbol.
 
     :param symbol: Trading symbol (e.g., "XAUUSD").
-    :param action: "BUY" or "SELL".
-    :param lot_sizes: List of lot sizes for each stop order.
-    :param tp_price: Take Profit price for all stop orders.
-    :param stop_levels: List of price levels for stop orders.
-    :param magic_number: Magic number to identify the orders.
+    :param volume: Original volume to adjust.
+    :return: Adjusted volume.
     """
-    for level, lot_size in zip(stop_levels, lot_sizes):
-        # Determine the order type
+    symbol_info = mt5.symbol_info(symbol)
+    if not symbol_info:
+        raise RuntimeError(f"Failed to retrieve symbol info for {symbol}.")
+
+    volume_step = symbol_info.volume_step
+    volume_min = symbol_info.volume_min
+    volume_max = symbol_info.volume_max
+
+    # Adjust volume to nearest multiple of volume_step and round to two decimals
+    adjusted_volume = round(round(volume / volume_step) * volume_step, 2)
+
+    # Ensure volume is within min/max limits
+    if adjusted_volume < volume_min:
+        adjusted_volume = volume_min
+    elif adjusted_volume > volume_max:
+        adjusted_volume = volume_max
+
+    return adjusted_volume
+
+
+def place_stop_orders(symbol, action, lot_sizes, tp_price, stop_levels, magic_number):
+    """
+    Place stop orders with validated stop levels, adjusting volume to the nearest valid step.
+    """
+    # Validate stop levels
+    valid_stop_levels = validate_stop_levels(symbol, stop_levels)
+
+    for level, lot_size in zip(valid_stop_levels, lot_sizes):
+        # Adjust the lot size
+        adjusted_lot_size = adjust_volume(symbol, lot_size)
+
+        # Determine order type
         order_type = mt5.ORDER_TYPE_BUY_STOP if action == "BUY" else mt5.ORDER_TYPE_SELL_STOP
 
         # Prepare the stop order request
         request = {
             "action": mt5.TRADE_ACTION_PENDING,
             "symbol": symbol,
-            "volume": lot_size,
+            "volume": adjusted_lot_size,
             "type": order_type,
             "price": level,
             "tp": tp_price,
@@ -149,19 +176,20 @@ def place_stop_orders(symbol, action, lot_sizes, tp_price, stop_levels, magic_nu
             "type_filling": mt5.ORDER_FILLING_IOC,
         }
 
+        # Log the request
+        print("Attempting to place STOP order:")
+        print(f"  Lot Size: {adjusted_lot_size}")
+        print(f"  SL: {request['sl']}")
+        print(f"  TP: {request['tp']}")
+        print(f"  Comment: {request['comment']}")
+        print(f"  Request Data: {request}")
+
         # Send the request
         result = mt5.order_send(request)
-
-        # Check if result is None
-        if result is None:
-            print(f"Failed to send {action} STOP order at level {level}. Result is None.")
-            continue
-
-        # Handle result and log response
         if result.retcode != mt5.TRADE_RETCODE_DONE:
-            print(f"Failed to place {action} STOP order at level {level}: {result.retcode}")
+            print(f"Failed to place {action} STOP order at level {level:.2f}: {result.retcode}")
         else:
-            print(f"{action} STOP order placed successfully at level {level}: {result}")
+            print(f"{action} STOP order placed successfully at level {level:.2f}: {result}")
 
 
 def calculate_initial_lot_size(loss_in_dollars, sl_distance, pip_value):
@@ -175,11 +203,39 @@ def calculate_initial_lot_size(loss_in_dollars, sl_distance, pip_value):
     return round(loss_in_dollars / (sl_distance * pip_value), 2)
 
 
-def calculate_stop_levels(tp_distance, top_up_levels):
+def calculate_stop_levels(symbol, action, top_up_levels, number_of_pips):
     """
-    Calculate stop levels based on TP distance and percentage levels.
+    Calculate and validate stop levels for a given symbol and action.
     """
-    return [tp_distance * (level / 100) for level in top_up_levels]
+    symbol_info = mt5.symbol_info(symbol)
+    if not symbol_info:
+        raise RuntimeError(f"Failed to retrieve symbol info for {symbol}.")
+    tick = mt5.symbol_info_tick(symbol)
+    if not tick:
+        raise RuntimeError(f"Failed to retrieve tick data for {symbol}.")
+
+    min_stop_distance = symbol_info.trade_stops_level * symbol_info.point
+
+    current_price = tick.ask if action == "BUY" else tick.bid
+
+    # Calculate raw stop levels
+    raw_levels = [
+        current_price + (level / 100 * number_of_pips * symbol_info.point) if action == "BUY" else
+        current_price - (level / 100 * number_of_pips * symbol_info.point)
+        for level in top_up_levels
+    ]
+
+    # Validate levels against min stop distance
+    valid_levels = []
+    for level in raw_levels:
+        distance_from_current_price = abs(level - current_price) / symbol_info.point  # Convert to pips
+        print(f"Checking level {level:.2f}: Distance from current price = {distance_from_current_price:.2f} pips")
+        if abs(level - current_price) >= min_stop_distance:
+            valid_levels.append(round(level, symbol_info.digits))
+        else:
+            print(f"Invalid stop level {level:.2f}: Distance ({distance_from_current_price:.2f} pips) < Minimum ({min_stop_distance / symbol_info.point:.2f} pips)")
+    print(f"Validated Levels: {valid_levels}")
+    return valid_levels
 
 
 def calculate_order_contributions(lot_size, tp_price, stop_levels, current_price, pip_value):
@@ -201,22 +257,22 @@ def calculate_order_contributions(lot_size, tp_price, stop_levels, current_price
     return contributions, total_contribution
 
 
-def print_order_contributions_with_be(contributions, lot_sizes, be_levels, total_contribution, direction):
+def print_order_contributions_with_be(contributions, lot_sizes, be_levels, total_contribution, direction, sl_levels, symbol):
     """
-    Print the contributions, lot sizes, and BE levels for each order in a given direction (BUY/SELL).
-
-    :param contributions: List of contributions in dollars for each order.
-    :param lot_sizes: List of lot sizes for each order.
-    :param be_levels: List of break-even levels in pips for stop orders.
-    :param total_contribution: Total contribution in dollars.
-    :param direction: Direction (e.g., "BUY" or "SELL").
+    Print the contributions, lot sizes, BE levels, and SL levels for each order in a given direction (BUY/SELL).
     """
-    print(f"\n{direction} Orders:")
+    symbol_info = mt5.symbol_info(symbol)
+    print(f"\n--- {direction} Orders ---\n")
     for i, (contribution, lot_size) in enumerate(zip(contributions, lot_sizes), start=1):
         # Include BE level if it's a stop order (not the initial market order)
-        be_level = f"BE_Level_{i - 1}: {be_levels[i - 2]} pips" if i > 1 else ""
-        print(f"  Order {i}: ${contribution:.2f} (Lot Size: {lot_size:.2f}) {be_level}")
+        be_level_text = f"BE_Level_{i - 1}: {be_levels[i - 2]:.2f} pips" if i > 1 else ""
+
+        # Correctly display SL levels in pips
+        sl_level_text = f"SL_Level: {sl_levels[i - 1] / symbol_info.point:.1f} pips" if i <= len(sl_levels) else "SL_Level: N/A"
+
+        print(f"  Order {i}: ${contribution:.2f} (Lot Size: {lot_size:.2f}) {be_level_text} {sl_level_text}")
     print(f"  Total {direction} Contribution: ${total_contribution:.2f}")
+
 
 
 def calculate_stepped_lot_sizes(initial_lot_size, total_goal, tp_distance, pip_value, num_orders):
@@ -339,6 +395,43 @@ def calculate_contributions(lot_sizes, tp_distance, pip_value):
     return contributions, total_contribution
 
 
+def validate_stop_levels(symbol, stop_levels):
+    """
+    Validate that stop levels are within the acceptable range for the symbol.
+    """
+    symbol_info = mt5.symbol_info(symbol)
+    if not symbol_info:
+        raise RuntimeError(f"Failed to retrieve symbol info for {symbol}.")
+
+    min_stop_distance = symbol_info.trade_stops_level * symbol_info.point
+
+    tick = mt5.symbol_info_tick(symbol)
+    if not tick:
+        raise RuntimeError(f"Failed to retrieve tick data for {symbol}.")
+
+    valid_levels = []
+    for level in stop_levels:
+        if abs(level - tick.bid) >= min_stop_distance and abs(level - tick.ask) >= min_stop_distance:
+            valid_levels.append(level)
+        else:
+            print(f"Invalid stop level {level:.2f}: below minimum stop distance.")
+    return valid_levels
+
+
+def calculate_sl_levels(current_price, stop_levels, symbol_info):
+    """
+    Calculate SL levels in pips based on the stop levels and current price.
+
+    :param current_price: Current price of the symbol.
+    :param stop_levels: List of stop levels in price points.
+    :param symbol_info: MetaTrader 5 symbol information.
+    :return: List of SL levels in pips.
+    """
+    point = symbol_info.point
+    sl_levels = [round(abs(current_price - level) / point, 2) for level in stop_levels]
+    return sl_levels
+
+
 def main():
     # Ensure MetaTrader 5 is initialized
     if not mt5.initialize():
@@ -397,9 +490,48 @@ def main():
             pip_value=pip_value
         )
 
-        # Print calculated lot sizes and BE levels
+        # Retrieve current prices and symbol info
+        tick = mt5.symbol_info_tick(symbol)
+        if not tick:
+            raise RuntimeError(f"Failed to retrieve tick data for {symbol}.")
+        symbol_info = mt5.symbol_info(symbol)
+        if not symbol_info:
+            raise RuntimeError(f"Failed to retrieve symbol info for {symbol}.")
+        current_price_buy = tick.ask
+        current_price_sell = tick.bid
+
+        # Hämta aktuellt pris
+        tick = mt5.symbol_info_tick(symbol)
+        if not tick:
+            raise RuntimeError(f"Failed to retrieve tick data for {symbol}.")
+        symbol_info = mt5.symbol_info(symbol)
+        if not symbol_info:
+            raise RuntimeError(f"Failed to retrieve symbol info for {symbol}.")
+        current_price = tick.ask  # Antag BUY-riktning för initiala beräkningar
+
+        # Beräkna TP-nivåer för BUY och SELL
+        buy_tp_price = current_price + (number_of_pips * symbol_info.point)
+        sell_tp_price = current_price - (number_of_pips * symbol_info.point)
+
+        # Validering av nivåer
+        stop_levels_buy = calculate_stop_levels(symbol, "BUY", [top_up_levels1, top_up_levels2, top_up_levels3],
+                                                number_of_pips)
+        stop_levels_sell = calculate_stop_levels(symbol, "SELL", [top_up_levels1, top_up_levels2, top_up_levels3],
+                                                 number_of_pips)
+
+        # Logga validerade nivåer
+        print(f"Validated BUY Stop Levels: {stop_levels_buy}")
+        print(f"Validated SELL Stop Levels: {stop_levels_sell}")
+
+        # Beräkna SL-nivåer i pips
+        sl_levels_buy = [(level - tick.ask) / symbol_info.point for level in stop_levels_buy]
+        sl_levels_sell = [(tick.bid - level) / symbol_info.point for level in stop_levels_sell]
+
+        print(f"SL Levels in pips for BUY: {[round(level, 2) for level in sl_levels_buy]}")
+        print(f"SL Levels in pips for SELL: {[round(level, 2) for level in sl_levels_sell]}")
+
+        # Utskrift
         print("\n--- BUY Orders ---")
-        buy_tp_price = mt5.symbol_info_tick(symbol).ask + (number_of_pips * mt5.symbol_info(symbol).point)
         print_order_contributions_with_be(
             contributions=[
                 gain_in_dollars_initial,
@@ -410,11 +542,12 @@ def main():
             lot_sizes=lot_sizes,
             be_levels=be_levels,
             total_contribution=total_gain,
-            direction="BUY"
+            direction="BUY",
+            sl_levels=sl_levels_buy,
+            symbol=symbol  # Lägg till symbol här
         )
 
         print("\n--- SELL Orders ---")
-        sell_tp_price = mt5.symbol_info_tick(symbol).bid - (number_of_pips * mt5.symbol_info(symbol).point)
         print_order_contributions_with_be(
             contributions=[
                 gain_in_dollars_initial,
@@ -425,7 +558,9 @@ def main():
             lot_sizes=lot_sizes,
             be_levels=be_levels,
             total_contribution=total_gain,
-            direction="SELL"
+            direction="SELL",
+            sl_levels=sl_levels_sell,
+            symbol=symbol  # Lägg till symbol här
         )
 
         # Confirm before placing orders
@@ -437,17 +572,8 @@ def main():
             place_market_order(symbol, "BUY", lot_sizes[0], number_of_pips, initial_stop_level, 1001)
             place_market_order(symbol, "SELL", lot_sizes[0], number_of_pips, initial_stop_level, 1002)
 
-            # Place STOP orders
-            stop_levels_buy = [
-                mt5.symbol_info_tick(symbol).ask + (top_up_levels1 * mt5.symbol_info(symbol).point),
-                mt5.symbol_info_tick(symbol).ask + (top_up_levels2 * mt5.symbol_info(symbol).point),
-                mt5.symbol_info_tick(symbol).ask + (top_up_levels3 * mt5.symbol_info(symbol).point)
-            ]
-            stop_levels_sell = [
-                mt5.symbol_info_tick(symbol).bid - (top_up_levels1 * mt5.symbol_info(symbol).point),
-                mt5.symbol_info_tick(symbol).bid - (top_up_levels2 * mt5.symbol_info(symbol).point),
-                mt5.symbol_info_tick(symbol).bid - (top_up_levels3 * mt5.symbol_info(symbol).point)
-            ]
+            print(f"Validated BUY Stop Levels: {stop_levels_buy}")
+            print(f"Validated SELL Stop Levels: {stop_levels_sell}")
 
             place_stop_orders(symbol, "BUY", lot_sizes[1:], buy_tp_price, stop_levels_buy, 1001)
             place_stop_orders(symbol, "SELL", lot_sizes[1:], sell_tp_price, stop_levels_sell, 1002)
@@ -458,7 +584,6 @@ def main():
 
     finally:
         pass
-
 
 
 if __name__ == "__main__":
