@@ -4,8 +4,7 @@ from settings import (
     target_gain_percent,
     number_of_pips,
     initial_stop_level,
-    magic_number_buy,
-    magic_number_sell,
+    initial_stop_percent,
     symbol,
     top_up_levels1,
     top_up_levels2,
@@ -16,32 +15,122 @@ from settings import (
 def get_pip_value(symbol):
     """
     Calculate the pip value for a given symbol dynamically from MT5.
-
-    :param symbol: Trading symbol (e.g., "XAUUSD").
-    :return: Pip value in account currency.
     """
     symbol_info = mt5.symbol_info(symbol)
     if not symbol_info:
         raise RuntimeError(f"Failed to retrieve symbol info for {symbol}.")
 
-    # Contract size (e.g., 100,000 for Forex, 1 for indices, etc.)
     contract_size = symbol_info.trade_contract_size
-
-    # Point size (e.g., 0.0001 for EURUSD, 0.01 for XAUUSD)
     point = symbol_info.point
+    pip_value = contract_size * point
+    return pip_value
 
-    # Tick value (value of a 1-point price movement)
-    tick_value = contract_size * point
+def get_spread_in_pips(symbol):
+    """
+    Retrieve the spread in pips for a given symbol.
+    """
+    tick = mt5.symbol_info_tick(symbol)
+    if not tick:
+        return None
+    spread = mt5.symbol_info(symbol).spread
+    point = mt5.symbol_info(symbol).point
+    return spread * point
 
-    # Pip value is based on tick value
-    return tick_value
+def calculate_pip_gain(number_of_pips, spread_in_pips, top_up_levels1, top_up_levels2, top_up_levels3):
+    """
+    Beräknar pip gain för initial order och stop orders.
+    """
+    pip_gains = {
+        'initial': round(number_of_pips - spread_in_pips, 2),
+        'stop_1': round(number_of_pips * (1 - (top_up_levels1 / 100)) - spread_in_pips, 2),
+        'stop_2': round(number_of_pips * (1 - (top_up_levels2 / 100)) - spread_in_pips, 2),
+        'stop_3': round(number_of_pips * (1 - (top_up_levels3 / 100)) - spread_in_pips, 2)
+    }
+    return pip_gains
 
-def place_stop_orders(symbol, action, lot_size, tp_price, stop_levels, magic_number):
+def calculate_gain_in_dollars(lot_size, pip_gain, pip_value):
+    """
+    Calculate the gain in dollars for a given lot size and pip gain.
+    """
+    return round(lot_size * pip_gain * pip_value, 2)
+
+
+def calculate_loss_in_dollars(initial_stop_percent, account_size):
+    """
+    Calculate the loss in dollars based on the risk percentage and account size.
+    """
+    return (initial_stop_percent / 100) * account_size
+
+
+def place_market_order(symbol, action, lot_size, tp_distance, sl_distance, magic_number):
+    """
+    Places a market order (BUY/SELL) with TP and SL distances in pips.
+
+    :param symbol: Trading symbol (e.g., "XAUUSD").
+    :param action: "BUY" or "SELL".
+    :param lot_size: Lot size for the market order.
+    :param tp_distance: Distance to Take Profit in pips.
+    :param sl_distance: Distance to Stop Loss in pips.
+    :param magic_number: Magic number to identify the order.
+    :return: Result of the order_send operation.
+    """
+    # Ensure the symbol is available
+    if not mt5.symbol_select(symbol, True):
+        print(f"Failed to select symbol {symbol}.")
+        return None
+
+    # Get the current price
+    tick = mt5.symbol_info_tick(symbol)
+    if not tick:
+        print(f"Failed to retrieve tick data for {symbol}.")
+        return None
+
+    price = tick.ask if action == "BUY" else tick.bid
+    point = mt5.symbol_info(symbol).point
+
+    # Calculate TP and SL prices
+    tp_price = price + (tp_distance * point) if action == "BUY" else price - (tp_distance * point)
+    sl_price = price - (sl_distance * point) if action == "BUY" else price + (sl_distance * point)
+
+    # Prepare the trade request
+    request = {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": symbol,
+        "volume": lot_size,
+        "type": mt5.ORDER_TYPE_BUY if action == "BUY" else mt5.ORDER_TYPE_SELL,
+        "price": price,
+        "tp": tp_price,
+        "sl": sl_price,
+        "deviation": 10,
+        "magic": magic_number,
+        "comment": f"{action} order via script",
+        "type_time": mt5.ORDER_TIME_GTC,
+        "type_filling": mt5.ORDER_FILLING_IOC,
+    }
+
+    # Send the trade request
+    result = mt5.order_send(request)
+    if result.retcode != mt5.TRADE_RETCODE_DONE:
+        print(f"Failed to place {action} order: {result.retcode}")
+        return None
+
+    print(f"{action} order placed successfully: {result}")
+    return result
+
+
+def place_stop_orders(symbol, action, lot_sizes, tp_price, stop_levels, magic_number):
     """
     Places additional stop orders (BUY STOP / SELL STOP) with shared TP.
+
+    :param symbol: Trading symbol (e.g., "XAUUSD").
+    :param action: "BUY" or "SELL".
+    :param lot_sizes: List of lot sizes for each stop order.
+    :param tp_price: Take Profit price for all stop orders.
+    :param stop_levels: List of price levels for stop orders.
+    :param magic_number: Magic number to identify the orders.
     """
-    for level in stop_levels:
-        # Order type
+    for level, lot_size in zip(stop_levels, lot_sizes):
+        # Determine the order type
         order_type = mt5.ORDER_TYPE_BUY_STOP if action == "BUY" else mt5.ORDER_TYPE_SELL_STOP
 
         # Prepare the stop order request
@@ -62,68 +151,29 @@ def place_stop_orders(symbol, action, lot_size, tp_price, stop_levels, magic_num
 
         # Send the request
         result = mt5.order_send(request)
+
+        # Check if result is None
+        if result is None:
+            print(f"Failed to send {action} STOP order at level {level}. Result is None.")
+            continue
+
+        # Handle result and log response
         if result.retcode != mt5.TRADE_RETCODE_DONE:
             print(f"Failed to place {action} STOP order at level {level}: {result.retcode}")
         else:
             print(f"{action} STOP order placed successfully at level {level}: {result}")
 
-def place_market_order(symbol, action, lot_size, tp_distance, sl_distance, magic_number):
+
+def calculate_initial_lot_size(loss_in_dollars, sl_distance, pip_value):
     """
-    Places a market order (BUY/SELL) with TP and SL distances in pips.
+    Calculate the initial lot size based on dollar loss, stop-loss distance, and pip value.
+    :param loss_in_dollars: The maximum allowed dollar loss for the trade.
+    :param sl_distance: Distance to stop-loss in pips.
+    :param pip_value: Value of one pip for the symbol.
+    :return: Lot size for the initial order.
     """
-    # Ensure symbol is available
-    if not mt5.symbol_select(symbol, True):
-        print(f"Failed to select symbol {symbol}.")
-        return None
+    return round(loss_in_dollars / (sl_distance * pip_value), 2)
 
-    # Get current prices
-    tick = mt5.symbol_info_tick(symbol)
-    if not tick:
-        print(f"Failed to retrieve tick data for {symbol}.")
-        return None
-
-    price = tick.ask if action == "BUY" else tick.bid
-    point = mt5.symbol_info(symbol).point
-
-    # Calculate TP and SL prices
-    tp_price = price + (tp_distance * point) if action == "BUY" else price - (tp_distance * point)
-    sl_price = price - (sl_distance * point) if action == "BUY" else price + (sl_distance * point)
-
-    # Prepare the request
-    request = {
-        "action": mt5.TRADE_ACTION_DEAL,
-        "symbol": symbol,
-        "volume": lot_size,
-        "type": mt5.ORDER_TYPE_BUY if action == "BUY" else mt5.ORDER_TYPE_SELL,
-        "price": price,
-        "tp": tp_price,
-        "sl": sl_price,
-        "deviation": 10,
-        "magic": magic_number,
-        "comment": f"{action} order via script",
-        "type_time": mt5.ORDER_TIME_GTC,
-        "type_filling": mt5.ORDER_FILLING_IOC,
-    }
-
-    # Send the request
-    result = mt5.order_send(request)
-    if result.retcode != mt5.TRADE_RETCODE_DONE:
-        print(f"Failed to place {action} order: {result.retcode}")
-        return None
-
-    print(f"{action} order placed successfully: {result}")
-    return result
-
-def calculate_lot_size_per_order(account_size, target_gain_percent, tp_distance, pip_value, num_orders):
-    """
-    Calculate the lot size per order to achieve the target gain percentage.
-    """
-    # Calculate the target gain in dollars
-    target_gain_dollars = account_size * (target_gain_percent / 100)
-
-    # Calculate the lot size per order
-    lot_size = round(target_gain_dollars / (num_orders * tp_distance * pip_value), 2)
-    return lot_size
 
 def calculate_stop_levels(tp_distance, top_up_levels):
     """
@@ -131,81 +181,17 @@ def calculate_stop_levels(tp_distance, top_up_levels):
     """
     return [tp_distance * (level / 100) for level in top_up_levels]
 
-def get_spread(symbol):
-    """
-    Calculate the spread for the given symbol.
-    """
-    tick = mt5.symbol_info_tick(symbol)
-    if not tick:
-        raise RuntimeError(f"Failed to retrieve tick data for {symbol}.")
-    return tick.ask - tick.bid
-
-def calculate_correct_lot_size(account_size, target_gain_percent, tp_distances, pip_value):
-    """
-    Calculate the correct lot size to meet the target gain based on distances to TP.
-
-    :param account_size: Account size in dollars.
-    :param target_gain_percent: Target gain as a percentage of account size.
-    :param tp_distances: List of distances to TP for all orders.
-    :param pip_value: Value of one pip for the symbol.
-    :return: Correct lot size.
-    """
-    total_goal = account_size * (target_gain_percent / 100)
-
-    # Sum up the total pips from all orders
-    total_pips = sum(tp_distances)
-
-    # Calculate the lot size
-    lot_size = round(total_goal / (total_pips * pip_value), 2)
-    return lot_size
-
-def calculate_order_profits(lot_size, tp_distance, pip_value):
-    """
-    Calculate the profit contribution of an order in dollars.
-    """
-    return lot_size * tp_distance * pip_value
-
-def calculate_and_confirm_orders(account_size, target_gain_percent, lot_size, tp_distance, pip_value, num_orders):
-    """
-    Calculate total goal and individual contributions for BUY and SELL orders,
-    and confirm before placing orders.
-    """
-    # Calculate total goal
-    goal = account_size * (target_gain_percent / 100)
-
-    # Calculate individual contributions
-    order_profit = calculate_order_profits(lot_size, tp_distance, pip_value)
-    total_profit = order_profit * num_orders
-
-    # Print calculations for review
-    print("\n--- Profit Calculation ---")
-    print(f"Total Goal (BUY/SELL): ${goal:.2f}")
-    print(f"Profit per Order: ${order_profit:.2f}")
-    print(f"Total Profit from {num_orders} Orders: ${total_profit:.2f}")
-
-    # Confirm before placing orders
-    confirm = input("\nDo you want to proceed with placing the orders? (Y/N): ").strip().upper()
-    return confirm == "Y"
 
 def calculate_order_contributions(lot_size, tp_price, stop_levels, current_price, pip_value):
     """
     Calculate the profit contributions of all orders based on their distance to TP.
-
-    :param lot_size: Lot size for all orders.
-    :param tp_price: Take Profit price.
-    :param stop_levels: List of stop order prices.
-    :param current_price: Current price (entry price of the market order).
-    :param pip_value: Value of one pip for the symbol.
-    :return: List of contributions for each order and the total contribution.
     """
     contributions = []
 
-    # Market order contribution
     market_order_distance = abs(tp_price - current_price)
     market_order_pips = market_order_distance / mt5.symbol_info(symbol).point
     contributions.append(round(lot_size * market_order_pips * pip_value, 2))
 
-    # Stop orders contributions
     for stop_level in stop_levels:
         stop_order_distance = abs(tp_price - stop_level)
         stop_order_pips = stop_order_distance / mt5.symbol_info(symbol).point
@@ -214,68 +200,144 @@ def calculate_order_contributions(lot_size, tp_price, stop_levels, current_price
     total_contribution = sum(contributions)
     return contributions, total_contribution
 
-def calculate_lot_size_to_reach_target(account_size, target_gain_percent, tp_distance, pip_value, num_orders):
+
+def print_order_contributions_with_be(contributions, lot_sizes, be_levels, total_contribution, direction):
     """
-    Calculate the lot size per order to achieve the target gain if all orders reach TP.
-
-    :param account_size: Account size in dollars.
-    :param target_gain_percent: Target gain as a percentage of account size.
-    :param tp_distance: Distance to TP in pips.
-    :param pip_value: Value of one pip for the symbol.
-    :param num_orders: Total number of orders in one direction (e.g., BUY or SELL).
-    :return: Lot size per order.
-    """
-    # Calculate total gain in dollars
-    total_gain = account_size * (target_gain_percent / 100)
-
-    # Calculate lot size
-    lot_size = round(total_gain / (num_orders * tp_distance * pip_value), 2)
-    return lot_size
-
-def display_and_confirm_order_profits(account_size, target_gain_percent, lot_size, tp_distance, pip_value, num_orders):
-    """
-    Display profit contributions for each order and confirm before placing orders.
-
-    :param account_size: Account size in dollars.
-    :param target_gain_percent: Target gain as a percentage of account size.
-    :param lot_size: Lot size for the orders.
-    :param tp_distance: Distance to TP in pips.
-    :param pip_value: Value of one pip for the symbol.
-    :param num_orders: Total number of orders in one direction.
-    :return: Boolean indicating whether to proceed with placing orders.
-    """
-    # Calculate total goal
-    goal = account_size * (target_gain_percent / 100)
-
-    # Calculate contributions and total profit
-    contributions, total_profit = calculate_order_contributions(lot_size, tp_distance, pip_value, num_orders)
-
-    # Display profit calculation
-    print("\n--- Profit Contributions ---")
-    print(f"Total Goal: ${goal:.2f}")
-    print(f"Profit per Order: ${contributions[0]:.2f}")
-    print(f"Total Profit from {num_orders} Orders: ${total_profit:.2f}")
-    print("\nIndividual Contributions:")
-    for i, contribution in enumerate(contributions, 1):
-        print(f"Order {i}: ${contribution:.2f}")
-
-    # Confirm
-    confirm = input("\nDo you want to proceed with placing the orders? (Y/N): ").strip().upper()
-    return confirm == "Y"
-
-def print_order_contributions(contributions, lot_sizes, total_contribution, direction):
-    """
-    Print the contributions and lot sizes for each order in a given direction (BUY/SELL).
+    Print the contributions, lot sizes, and BE levels for each order in a given direction (BUY/SELL).
 
     :param contributions: List of contributions in dollars for each order.
     :param lot_sizes: List of lot sizes for each order.
+    :param be_levels: List of break-even levels in pips for stop orders.
     :param total_contribution: Total contribution in dollars.
     :param direction: Direction (e.g., "BUY" or "SELL").
     """
     print(f"\n{direction} Orders:")
-    for i, (contribution, lot_size) in enumerate(zip(contributions, lot_sizes), 1):
-        print(f"  Order {i}: ${contribution:.2f} (Lot Size: {lot_size:.2f})")
+    for i, (contribution, lot_size) in enumerate(zip(contributions, lot_sizes), start=1):
+        # Include BE level if it's a stop order (not the initial market order)
+        be_level = f"BE_Level_{i - 1}: {be_levels[i - 2]} pips" if i > 1 else ""
+        print(f"  Order {i}: ${contribution:.2f} (Lot Size: {lot_size:.2f}) {be_level}")
     print(f"  Total {direction} Contribution: ${total_contribution:.2f}")
+
+
+def calculate_stepped_lot_sizes(initial_lot_size, total_goal, tp_distance, pip_value, num_orders):
+    """
+    Calculate progressively increasing lot sizes to reach the total goal.
+
+    :param initial_lot_size: Lot size for the initial market order.
+    :param total_goal: Target profit in dollars.
+    :param tp_distance: Distance to TP in pips.
+    :param pip_value: Value of one pip for the symbol.
+    :param num_orders: Total number of orders in one direction (including market and stop orders).
+    :return: List of lot sizes for each order.
+    """
+    # Calculate the required contribution per pip for the total goal
+    total_pip_value = total_goal / (tp_distance * pip_value)
+    lot_sizes = [initial_lot_size]
+
+    current_contribution = initial_lot_size * tp_distance * pip_value
+
+    for i in range(num_orders - 1):
+        # Remaining goal after previous contributions
+        remaining_goal = total_goal - current_contribution
+
+        # Remaining orders to contribute
+        remaining_orders = num_orders - len(lot_sizes)
+
+        # Calculate the required lot size for the next order
+        next_lot_size = remaining_goal / (remaining_orders * tp_distance * pip_value)
+        next_lot_size = max(next_lot_size, lot_sizes[-1])  # Ensure progressive increase
+        lot_sizes.append(round(next_lot_size, 2))
+
+        # Update the current contribution
+        current_contribution += next_lot_size * tp_distance * pip_value
+
+    return lot_sizes
+
+
+def calculate_stepped_lot_sizes_exact(initial_lot_size, total_goal, tp_distance, pip_value, num_orders):
+    """
+    Calculate dynamically adjusted lot sizes to match the exact total goal.
+
+    :param initial_lot_size: Lot size for the initial market order.
+    :param total_goal: Target profit in dollars.
+    :param tp_distance: Distance to TP in pips.
+    :param pip_value: Value of one pip for the symbol.
+    :param num_orders: Total number of orders in one direction (including market and stop orders).
+    :return: List of lot sizes for each order.
+    """
+    lot_sizes = [initial_lot_size]
+    current_total = initial_lot_size * tp_distance * pip_value
+
+    for i in range(num_orders - 1):
+        # Remaining goal after current contributions
+        remaining_goal = total_goal - current_total
+
+        # Calculate the required lot size for the next order
+        next_lot_size = remaining_goal / ((num_orders - len(lot_sizes)) * tp_distance * pip_value)
+
+        # Append and update total contribution
+        lot_sizes.append(round(next_lot_size, 2))
+        current_total += next_lot_size * tp_distance * pip_value
+
+    # Final adjustment to ensure exact match
+    final_adjustment = (total_goal - sum([lot * tp_distance * pip_value for lot in lot_sizes])) / (
+                tp_distance * pip_value)
+    lot_sizes[-1] += round(final_adjustment, 2)
+
+    return lot_sizes
+
+
+def calculate_be_levels(initial_lot_size, lot_sizes, tp_distance, pip_value):
+    """
+    Calculate the break-even levels for each stop order.
+
+    :param initial_lot_size: Lot size for the initial market order.
+    :param lot_sizes: List of lot sizes for stop orders.
+    :param tp_distance: Distance to TP in pips.
+    :param pip_value: Value of one pip for the symbol.
+    :return: List of break-even levels in pips.
+    """
+    be_levels = []
+    cumulative_profit = 0
+
+    # Calculate BE levels for each stop order
+    for i, lot_size in enumerate(lot_sizes, start=1):
+        # Profit from previous orders
+        cumulative_profit += initial_lot_size * tp_distance * pip_value
+
+        # BE level for the current stop order
+        be_level = cumulative_profit / (lot_size * pip_value)
+        be_levels.append(round(be_level, 2))
+
+    return be_levels
+
+
+def verify_total_contribution(lot_sizes, tp_distance, pip_value):
+    """
+    Verify the total contribution from all orders matches the total goal.
+
+    :param lot_sizes: List of lot sizes for all orders.
+    :param tp_distance: Distance to TP in pips.
+    :param pip_value: Value of one pip for the symbol.
+    :return: Total contribution in dollars.
+    """
+    total_contribution = sum(lot_size * tp_distance * pip_value for lot_size in lot_sizes)
+    return total_contribution
+
+
+def calculate_contributions(lot_sizes, tp_distance, pip_value):
+    """
+    Calculate contributions in dollars for each order based on lot sizes.
+
+    :param lot_sizes: List of lot sizes for all orders.
+    :param tp_distance: Distance to TP in pips.
+    :param pip_value: Value of one pip for the symbol.
+    :return: List of contributions for each order and total contribution.
+    """
+    contributions = [round(lot_size * tp_distance * pip_value, 2) for lot_size in lot_sizes]
+    total_contribution = round(sum(contributions), 2)
+    return contributions, total_contribution
+
 
 def main():
     # Ensure MetaTrader 5 is initialized
@@ -284,81 +346,120 @@ def main():
         raise RuntimeError("Failed to initialize MetaTrader 5")
 
     try:
-        # Retrieve pip value dynamically
+        # Fetch spread and pip value
+        spread_in_pips = get_spread_in_pips(symbol)
+        if spread_in_pips is None:
+            raise RuntimeError("Failed to retrieve spread in pips.")
         pip_value = get_pip_value(symbol)
-        print(f"Pip Value for {symbol}: {pip_value}")
+        if pip_value is None:
+            raise RuntimeError("Failed to retrieve pip value.")
+        print(f"Spread in pips for {symbol}: {spread_in_pips:.2f}")
+        print(f"Pip value for {symbol}: {pip_value:.2f}")
 
-        # Calculate total_goal
-        total_goal = account_size * (target_gain_percent / 100)
-        print(f"Total Goal (Profit Target): ${total_goal:.2f}")
+        # Calculate total goal and loss in dollars
+        total_gain = (account_size * target_gain_percent) / 100
+        print(f"Total Goal (Profit Target): ${total_gain:.2f}")
+        loss_in_dollars = calculate_loss_in_dollars(initial_stop_percent, account_size)
 
-        # Adjust distances for pips
-        tp_distance = number_of_pips
-        sl_distance = initial_stop_level
+        # Calculate initial lot size
+        initial_lot_size = calculate_initial_lot_size(
+            loss_in_dollars=loss_in_dollars,
+            sl_distance=initial_stop_level,
+            pip_value=pip_value
+        )
+        print(f"Initial Lot Size: {initial_lot_size:.2f}")
 
-        # Total number of orders per direction (market + 3 stop orders)
-        num_orders = 4
+        # Calculate pip gains
+        pip_gains = calculate_pip_gain(number_of_pips, spread_in_pips, top_up_levels1, top_up_levels2, top_up_levels3)
 
-        # Calculate lot size per order to meet target gain
-        lot_size = calculate_lot_size_to_reach_target(
-            account_size, target_gain_percent, tp_distance, pip_value, num_orders
+        # Calculate gains in dollars for each level
+        gain_in_dollars_initial = calculate_gain_in_dollars(initial_lot_size, pip_gains['initial'], pip_value)
+        gain_in_dollars_stop_1 = ((total_gain - gain_in_dollars_initial) * top_up_levels1) / (
+                top_up_levels1 + top_up_levels2 + top_up_levels3)
+        gain_in_dollars_stop_2 = ((total_gain - gain_in_dollars_initial) * top_up_levels2) / (
+                top_up_levels1 + top_up_levels2 + top_up_levels3)
+        gain_in_dollars_stop_3 = ((total_gain - gain_in_dollars_initial) * top_up_levels3) / (
+                top_up_levels1 + top_up_levels2 + top_up_levels3)
+
+        # Calculate lot sizes for stop orders
+        lots_stop_1 = gain_in_dollars_stop_1 / (pip_gains['stop_1'] * pip_value)
+        lots_stop_2 = gain_in_dollars_stop_2 / (pip_gains['stop_2'] * pip_value)
+        lots_stop_3 = gain_in_dollars_stop_3 / (pip_gains['stop_3'] * pip_value)
+
+        # Combine lot sizes into a list
+        lot_sizes = [initial_lot_size, lots_stop_1, lots_stop_2, lots_stop_3]
+
+        # Calculate break-even levels for each stop order
+        be_levels = calculate_be_levels(
+            initial_lot_size=initial_lot_size,
+            lot_sizes=lot_sizes[1:],  # Exclude the initial order
+            tp_distance=number_of_pips,
+            pip_value=pip_value
         )
 
-        # Define percentage levels from settings
-        top_up_levels = [top_up_levels1, top_up_levels2, top_up_levels3]
-
-        # Get current price and spread
-        tick = mt5.symbol_info_tick(symbol)
-        if not tick:
-            raise RuntimeError(f"Failed to retrieve tick data for {symbol}.")
-        spread = get_spread(symbol)
-        current_price = tick.ask  # Assuming we're working with BUY orders first
-
-        # Calculate stop levels
-        stop_distances = calculate_stop_levels(tp_distance, top_up_levels)
-        stop_levels_buy = [current_price + (distance * mt5.symbol_info(symbol).point) + spread for distance in stop_distances]
-        stop_levels_sell = [current_price - (distance * mt5.symbol_info(symbol).point) - spread for distance in stop_distances]
-
-        # Calculate contributions for BUY and SELL
-        buy_tp_price = current_price + (tp_distance * mt5.symbol_info(symbol).point)
-        buy_contributions, buy_total = calculate_order_contributions(
-            lot_size, buy_tp_price, stop_levels_buy, current_price, pip_value
+        # Print calculated lot sizes and BE levels
+        print("\n--- BUY Orders ---")
+        buy_tp_price = mt5.symbol_info_tick(symbol).ask + (number_of_pips * mt5.symbol_info(symbol).point)
+        print_order_contributions_with_be(
+            contributions=[
+                gain_in_dollars_initial,
+                gain_in_dollars_stop_1,
+                gain_in_dollars_stop_2,
+                gain_in_dollars_stop_3
+            ],
+            lot_sizes=lot_sizes,
+            be_levels=be_levels,
+            total_contribution=total_gain,
+            direction="BUY"
         )
 
-        sell_tp_price = current_price - (tp_distance * mt5.symbol_info(symbol).point)
-        sell_contributions, sell_total = calculate_order_contributions(
-            lot_size, sell_tp_price, stop_levels_sell, current_price, pip_value
+        print("\n--- SELL Orders ---")
+        sell_tp_price = mt5.symbol_info_tick(symbol).bid - (number_of_pips * mt5.symbol_info(symbol).point)
+        print_order_contributions_with_be(
+            contributions=[
+                gain_in_dollars_initial,
+                gain_in_dollars_stop_1,
+                gain_in_dollars_stop_2,
+                gain_in_dollars_stop_3
+            ],
+            lot_sizes=lot_sizes,
+            be_levels=be_levels,
+            total_contribution=total_gain,
+            direction="SELL"
         )
-
-        # Print contributions and lot sizes
-        lot_sizes_buy = [lot_size for _ in range(num_orders)]  # Example: constant lot size
-        lot_sizes_sell = [lot_size for _ in range(num_orders)]  # Example: constant lot size
-
-        print_order_contributions(buy_contributions, lot_sizes_buy, buy_total, "BUY")
-        print_order_contributions(sell_contributions, lot_sizes_sell, sell_total, "SELL")
 
         # Confirm before placing orders
         confirm = input("\nDo you want to proceed with placing the orders? (Y/N): ").strip().upper()
-        if confirm != "Y":
+        if confirm == "Y":
+            print("Proceeding to place orders...")
+
+            # Place initial market orders
+            place_market_order(symbol, "BUY", lot_sizes[0], number_of_pips, initial_stop_level, 1001)
+            place_market_order(symbol, "SELL", lot_sizes[0], number_of_pips, initial_stop_level, 1002)
+
+            # Place STOP orders
+            stop_levels_buy = [
+                mt5.symbol_info_tick(symbol).ask + (top_up_levels1 * mt5.symbol_info(symbol).point),
+                mt5.symbol_info_tick(symbol).ask + (top_up_levels2 * mt5.symbol_info(symbol).point),
+                mt5.symbol_info_tick(symbol).ask + (top_up_levels3 * mt5.symbol_info(symbol).point)
+            ]
+            stop_levels_sell = [
+                mt5.symbol_info_tick(symbol).bid - (top_up_levels1 * mt5.symbol_info(symbol).point),
+                mt5.symbol_info_tick(symbol).bid - (top_up_levels2 * mt5.symbol_info(symbol).point),
+                mt5.symbol_info_tick(symbol).bid - (top_up_levels3 * mt5.symbol_info(symbol).point)
+            ]
+
+            place_stop_orders(symbol, "BUY", lot_sizes[1:], buy_tp_price, stop_levels_buy, 1001)
+            place_stop_orders(symbol, "SELL", lot_sizes[1:], sell_tp_price, stop_levels_sell, 1002)
+
+            print("All orders have been placed successfully.")
+        else:
             print("Order placement canceled by user.")
-            return
-
-        # Place initial BUY and SELL orders
-        buy_order = place_market_order(symbol, "BUY", lot_size, tp_distance, sl_distance, magic_number_buy)
-        sell_order = place_market_order(symbol, "SELL", lot_size, tp_distance, sl_distance, magic_number_sell)
-
-        if not buy_order or not sell_order:
-            print("Failed to place initial orders. Stopping script.")
-            return
-
-        # Place stop orders
-        place_stop_orders(symbol, "BUY", lot_size, buy_tp_price, stop_levels_buy, magic_number_buy)
-        place_stop_orders(symbol, "SELL", lot_size, sell_tp_price, stop_levels_sell, magic_number_sell)
 
     finally:
-        # Keep MT5 connection open
         pass
 
-# Execute the script
+
+
 if __name__ == "__main__":
     main()
